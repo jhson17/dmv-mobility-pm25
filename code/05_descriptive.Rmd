@@ -1,0 +1,423 @@
+---
+title: "Descriptive Analysis — Mobility-Driven PM2.5 Exposure Disparity in the DMV"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 5
+)
+```
+
+```{r libraries}
+library(tidyverse)
+library(scales)
+library(patchwork)
+```
+
+---
+
+## 1. Load Data
+
+```{r load}
+panel <- read_csv("../data/processed/final_data_monthly.csv",
+                  col_types = cols(GEOID = col_character()))
+
+demo <- read_csv("../data/processed/cbg_demographics.csv",
+                 col_types = cols(GEOID = col_character()))
+
+# Cross-section: average panel across all months, join demographics
+cross <- panel %>%
+  group_by(GEOID) %>%
+  summarise(
+    mean_delta_pm25   = mean(mean_delta_pm25,   na.rm = TRUE),
+    pct_trips_worse   = mean(pct_trips_worse,   na.rm = TRUE),
+    mobility_adj_pm25 = mean(mobility_adj_pm25, na.rm = TRUE),
+    residential_pm25  = mean(residential_pm25,  na.rm = TRUE),
+    n_destinations    = mean(n_destinations,    na.rm = TRUE),
+    total_visitors    = mean(total_visitors,    na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(demo, by = "GEOID") %>%
+  mutate(
+    log_median_income = log(median_income),
+    net_worse         = as.integer(mean_delta_pm25 > 0),
+    state             = case_when(
+      substr(GEOID, 1, 2) == "11" ~ "DC",
+      substr(GEOID, 1, 2) == "24" ~ "MD",
+      substr(GEOID, 1, 2) == "51" ~ "VA"
+    ),
+    income_q   = ntile(median_income,  4),
+    nonwhite_q = ntile(pct_nonwhite,   4),
+    noveh_q    = ntile(pct_no_vehicle, 4),
+    poverty_q  = ntile(pct_poverty,    4)
+  )
+
+cat("Panel rows     :", nrow(panel), "\n")
+cat("Unique CBGs    :", n_distinct(panel$GEOID), "\n")
+cat("Time periods   :", n_distinct(panel$time_id), "months\n")
+cat("Cross-section  :", nrow(cross), "CBGs\n")
+```
+
+---
+
+## 2. Variable Summaries
+
+```{r summaries}
+# Panel outcome variables
+panel %>%
+  select(mean_delta_pm25, pct_trips_worse, mobility_adj_pm25,
+         residential_pm25, n_destinations, total_visitors, pct_low_count) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  summarise(
+    n      = sum(!is.na(value)),
+    mean   = round(mean(value, na.rm = TRUE), 3),
+    sd     = round(sd(value,   na.rm = TRUE), 3),
+    min    = round(min(value,  na.rm = TRUE), 3),
+    median = round(median(value, na.rm = TRUE), 3),
+    max    = round(max(value,  na.rm = TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(caption = "Table 1. Panel Variable Summaries")
+```
+
+```{r demo-summaries}
+# Demographic variables
+cross %>%
+  select(pct_white, pct_black, pct_asian, pct_hispanic, pct_nonwhite,
+         median_income, pct_poverty, pct_no_vehicle,
+         pct_college, pct_renter, total_pop) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  summarise(
+    n      = sum(!is.na(value)),
+    mean   = round(mean(value, na.rm = TRUE), 2),
+    sd     = round(sd(value,   na.rm = TRUE), 2),
+    median = round(median(value, na.rm = TRUE), 2),
+    max    = round(max(value,  na.rm = TRUE), 2),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(caption = "Table 2. Demographic Variable Summaries (Cross-Section)")
+```
+
+---
+
+## 3. Overall Exposure — Headline Numbers
+
+```{r headline}
+total_pop <- sum(cross$total_pop, na.rm = TRUE)
+
+pw <- function(x, w) sum(x * w, na.rm = TRUE) / sum(w[!is.na(x)], na.rm = TRUE)
+
+tibble(
+  metric = c(
+    "Total DMV population in sample",
+    "Pop-weighted residential PM2.5 (ug/m3)",
+    "Pop-weighted mobility-adjusted PM2.5 (ug/m3)",
+    "Pop-weighted mean delta PM2.5 (ug/m3)",
+    "Underestimation from ignoring mobility (%)",
+    "People in net-worse CBGs",
+    "People in net-worse CBGs (%)"
+  ),
+  value = c(
+    format(total_pop, big.mark = ","),
+    round(pw(cross$residential_pm25,  cross$total_pop), 3),
+    round(pw(cross$mobility_adj_pm25, cross$total_pop), 3),
+    round(pw(cross$mean_delta_pm25,   cross$total_pop), 3),
+    round(pw(cross$mean_delta_pm25,   cross$total_pop) /
+          pw(cross$residential_pm25,  cross$total_pop) * 100, 1),
+    format(sum(cross$total_pop[cross$net_worse == 1], na.rm = TRUE),
+           big.mark = ","),
+    round(sum(cross$total_pop[cross$net_worse == 1], na.rm = TRUE) /
+          total_pop * 100, 1)
+  )
+) %>%
+  knitr::kable(caption = "Table 3. Population-Level Exposure Summary")
+```
+
+---
+
+## 4. Temporal Trends
+
+```{r temporal, fig.cap="Figure 1. Monthly mean delta PM2.5 across DMV CBGs, 2018-2021."}
+monthly <- panel %>%
+  group_by(year, month) %>%
+  summarise(
+    mean_delta = mean(mean_delta_pm25, na.rm = TRUE),
+    sd_delta   = sd(mean_delta_pm25,   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(date = as.Date(paste(year, month, "01", sep = "-")))
+
+ggplot(monthly, aes(x = date, y = mean_delta)) +
+  geom_ribbon(aes(ymin = mean_delta - sd_delta,
+                  ymax = mean_delta + sd_delta),
+              alpha = 0.15, fill = "#2166ac") +
+  geom_line(color = "#2166ac", linewidth = 0.8) +
+  geom_vline(xintercept = as.Date("2020-03-01"),
+             linetype = "dashed", color = "red", linewidth = 0.7) +
+  annotate("text", x = as.Date("2020-04-01"), y = max(monthly$mean_delta) * 0.95,
+           label = "COVID-19\nMarch 2020", color = "red", size = 3, hjust = 0) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  scale_y_continuous(labels = number_format(accuracy = 0.1)) +
+  labs(
+    x = NULL,
+    y = "Mean Delta PM2.5 (ug/m3)",
+    title = "Monthly Mobility-Driven PM2.5 Exposure Differential",
+    subtitle = "Shaded band = ±1 SD across CBGs"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r period-comparison}
+# Pre-COVID vs COVID era averages
+panel %>%
+  mutate(period = if_else(year %in% c(2018, 2019),
+                          "Pre-COVID (2018-2019)",
+                          "COVID Era (2020-2021)")) %>%
+  group_by(period) %>%
+  summarise(
+    mean_delta_pm25  = round(mean(mean_delta_pm25,  na.rm = TRUE), 3),
+    sd_delta_pm25    = round(sd(mean_delta_pm25,    na.rm = TRUE), 3),
+    pct_trips_worse  = round(mean(pct_trips_worse,  na.rm = TRUE), 1),
+    residential_pm25 = round(mean(residential_pm25, na.rm = TRUE), 3),
+    n                = n(),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(caption = "Table 4. Pre-COVID vs COVID Era Comparison")
+```
+
+```{r seasonal, fig.cap="Figure 2. Seasonal pattern in mean delta PM2.5 averaged across all years."}
+panel %>%
+  group_by(month) %>%
+  summarise(
+    mean_delta = mean(mean_delta_pm25, na.rm = TRUE),
+    se         = sd(mean_delta_pm25,   na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  mutate(month_label = month.abb[month]) %>%
+  ggplot(aes(x = factor(month, labels = month.abb), y = mean_delta)) +
+  geom_col(fill = "#2166ac", alpha = 0.8) +
+  geom_errorbar(aes(ymin = mean_delta - se, ymax = mean_delta + se),
+                width = 0.3, color = "gray40") +
+  labs(
+    x = "Month",
+    y = "Mean Delta PM2.5 (ug/m3)",
+    title = "Seasonal Pattern in Mobility-Driven Exposure Differential",
+    subtitle = "Error bars = ±1 SE"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+---
+
+## 5. Who Is Exposed — Demographic Quartile Analysis
+
+```{r quartile-tables}
+# Helper for quartile summary
+quartile_summary <- function(df, q_var, q_labels) {
+  df %>%
+    filter(!is.na(.data[[q_var]]), !is.na(mean_delta_pm25)) %>%
+    group_by(q = .data[[q_var]]) %>%
+    summarise(
+      n                = n(),
+      mean_delta_pm25  = round(mean(mean_delta_pm25,  na.rm = TRUE), 3),
+      sd_delta         = round(sd(mean_delta_pm25,    na.rm = TRUE), 3),
+      pct_trips_worse  = round(mean(pct_trips_worse,  na.rm = TRUE), 1),
+      pct_net_worse    = round(mean(net_worse,         na.rm = TRUE) * 100, 1),
+      .groups = "drop"
+    ) %>%
+    mutate(group = q_labels)
+}
+
+bind_rows(
+  quartile_summary(cross, "income_q",
+    c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")) %>% mutate(variable = "Income"),
+  quartile_summary(cross, "noveh_q",
+    c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")) %>% mutate(variable = "No-Vehicle"),
+  quartile_summary(cross, "poverty_q",
+    c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")) %>% mutate(variable = "Poverty"),
+  quartile_summary(cross, "nonwhite_q",
+    c("Q1 (most white)", "Q2", "Q3", "Q4 (most nonwhite)")) %>%
+    mutate(variable = "Pct Nonwhite")
+) %>%
+  select(variable, group, n, mean_delta_pm25, pct_trips_worse, pct_net_worse) %>%
+  knitr::kable(caption = "Table 5. Mean Delta PM2.5 by Demographic Quartile")
+```
+
+```{r quartile-chart, fig.cap="Figure 3. Mean delta PM2.5 by demographic quartile. No-vehicle and income show the clearest gradients."}
+plot_quartile <- function(df, q_var, title, x_labels) {
+  df %>%
+    filter(!is.na(.data[[q_var]]), !is.na(mean_delta_pm25)) %>%
+    group_by(q = .data[[q_var]]) %>%
+    summarise(mean_delta = mean(mean_delta_pm25, na.rm = TRUE),
+              se = sd(mean_delta_pm25, na.rm = TRUE) / sqrt(n()),
+              .groups = "drop") %>%
+    ggplot(aes(x = factor(q, labels = x_labels), y = mean_delta)) +
+    geom_col(fill = "#2166ac", alpha = 0.8) +
+    geom_errorbar(aes(ymin = mean_delta - se, ymax = mean_delta + se),
+                  width = 0.3, color = "gray40") +
+    labs(x = NULL, y = "Mean Delta PM2.5", title = title) +
+    theme_minimal(base_size = 10) +
+    theme(axis.text.x = element_text(size = 8))
+}
+
+p1 <- plot_quartile(cross, "noveh_q",  "No-Vehicle Quartile",
+                    c("Q1\n(low)", "Q2", "Q3", "Q4\n(high)"))
+p2 <- plot_quartile(cross, "income_q", "Income Quartile",
+                    c("Q1\n(low)", "Q2", "Q3", "Q4\n(high)"))
+p3 <- plot_quartile(cross, "poverty_q","Poverty Quartile",
+                    c("Q1\n(low)", "Q2", "Q3", "Q4\n(high)"))
+p4 <- plot_quartile(cross, "nonwhite_q","Pct Nonwhite Quartile",
+                    c("Q1\n(white)", "Q2", "Q3", "Q4\n(nonwhite)"))
+
+(p1 + p2) / (p3 + p4) +
+  plot_annotation(
+    title = "Mobility-Driven Exposure Differential by Demographic Quartile",
+    subtitle = "Error bars = ±1 SE"
+  )
+```
+
+---
+
+## 6. Population-Weighted Exposure
+
+```{r pop-weighted, fig.cap="Figure 4. Population-weighted mean delta PM2.5 by demographic group."}
+# Population counts by exposure threshold
+thresholds <- c(0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
+
+threshold_tbl <- map_dfr(thresholds, function(t) {
+  sub <- cross %>% filter(!is.na(mean_delta_pm25), mean_delta_pm25 >= t)
+  tibble(
+    threshold  = t,
+    n_cbgs     = nrow(sub),
+    population = sum(sub$total_pop, na.rm = TRUE),
+    pct_total  = round(sum(sub$total_pop, na.rm = TRUE) / total_pop * 100, 1)
+  )
+})
+
+threshold_tbl %>%
+  mutate(population = format(population, big.mark = ",")) %>%
+  knitr::kable(caption = "Table 6. Population Above Each Exposure Threshold")
+
+# Population-weighted delta by group
+groups_pw <- bind_rows(
+  cross %>%
+    filter(!is.na(noveh_q)) %>%
+    group_by(group = paste("No-Vehicle Q", noveh_q)) %>%
+    summarise(pw_delta = sum(mean_delta_pm25 * total_pop, na.rm=TRUE) /
+                         sum(total_pop, na.rm=TRUE),
+              pop = sum(total_pop, na.rm=TRUE), .groups="drop"),
+  cross %>%
+    filter(!is.na(income_q)) %>%
+    group_by(group = paste("Income Q", income_q)) %>%
+    summarise(pw_delta = sum(mean_delta_pm25 * total_pop, na.rm=TRUE) /
+                         sum(total_pop, na.rm=TRUE),
+              pop = sum(total_pop, na.rm=TRUE), .groups="drop"),
+  cross %>%
+    filter(!is.na(state)) %>%
+    group_by(group = state) %>%
+    summarise(pw_delta = sum(mean_delta_pm25 * total_pop, na.rm=TRUE) /
+                         sum(total_pop, na.rm=TRUE),
+              pop = sum(total_pop, na.rm=TRUE), .groups="drop")
+)
+
+ggplot(groups_pw, aes(x = reorder(group, pw_delta), y = pw_delta,
+                       fill = pw_delta)) +
+  geom_col(alpha = 0.9) +
+  geom_text(aes(label = round(pw_delta, 3)), hjust = -0.1, size = 3) +
+  scale_fill_gradient2(low = "#4575b4", mid = "white", high = "#d73027",
+                       midpoint = 0, guide = "none") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Population-Weighted Mean Delta PM2.5 (ug/m3)",
+    title = "Population-Weighted Exposure Differential by Group"
+  ) +
+  theme_minimal(base_size = 11) +
+  expand_limits(y = max(groups_pw$pw_delta) * 1.15)
+```
+
+---
+
+## 7. Compound Exposure
+
+```{r compound}
+med_res <- median(cross$residential_pm25, na.rm = TRUE)
+med_mob <- median(cross$mobility_adj_pm25, na.rm = TRUE)
+
+cross %>%
+  filter(!is.na(residential_pm25), !is.na(mobility_adj_pm25)) %>%
+  mutate(exposure_type = case_when(
+    residential_pm25 >= med_res & mobility_adj_pm25 >= med_mob ~ "Compound high",
+    residential_pm25 >= med_res & mobility_adj_pm25 <  med_mob ~ "High res / low mob",
+    residential_pm25 <  med_res & mobility_adj_pm25 >= med_mob ~ "Low res / high mob",
+    TRUE ~ "Both low"
+  )) %>%
+  group_by(exposure_type) %>%
+  summarise(
+    n_cbgs        = n(),
+    population    = sum(total_pop, na.rm = TRUE),
+    pct_of_total  = round(sum(total_pop, na.rm = TRUE) / total_pop * 100, 1),
+    pw_nonwhite   = round(sum(pct_nonwhite  * total_pop, na.rm=TRUE) /
+                          sum(total_pop, na.rm=TRUE), 1),
+    pw_poverty    = round(sum(pct_poverty   * total_pop, na.rm=TRUE) /
+                          sum(total_pop, na.rm=TRUE), 1),
+    pw_income     = round(sum(median_income * total_pop, na.rm=TRUE) /
+                          sum(total_pop, na.rm=TRUE), 0),
+    pw_noveh      = round(sum(pct_no_vehicle* total_pop, na.rm=TRUE) /
+                          sum(total_pop, na.rm=TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(population)) %>%
+  mutate(population = format(population, big.mark = ",")) %>%
+  knitr::kable(caption = "Table 7. Compound Exposure Groups — Population and Demographics")
+```
+
+---
+
+## 8. Correlation Matrix
+
+```{r correlation, fig.cap="Figure 5. Pearson correlation matrix of key variables."}
+corr_vars <- c("mean_delta_pm25", "residential_pm25", "mobility_adj_pm25",
+               "pct_nonwhite", "pct_poverty", "log_median_income",
+               "pct_no_vehicle", "pct_renter", "pct_college",
+               "n_destinations")
+
+corr_data <- cross %>%
+  select(all_of(corr_vars)) %>%
+  drop_na()
+
+corr_mat <- cor(corr_data, method = "pearson") %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "r")
+
+ggplot(corr_mat, aes(x = var1, y = var2, fill = r)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(r, 2)), size = 2.5) +
+  scale_fill_gradient2(low = "#4575b4", mid = "white", high = "#d73027",
+                       midpoint = 0, limits = c(-1, 1),
+                       name = "Pearson r") +
+  labs(
+    x = NULL, y = NULL,
+    title = "Correlation Matrix — Key Variables"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+---
+
+*End of descriptive analysis. Proceed to 06_spatial.Rmd for spatial diagnostics.*

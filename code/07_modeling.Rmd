@@ -1,0 +1,473 @@
+---
+title: "Regression Modeling — Mobility-Driven PM2.5 Exposure Disparity in the DMV"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 5
+)
+```
+
+```{r libraries}
+library(tidyverse)
+library(sf)
+library(spdep)
+library(spatialreg)
+library(tigris)
+library(sandwich)
+library(lmtest)
+library(scales)
+library(patchwork)
+
+select <- dplyr::select
+filter <- dplyr::filter
+
+options(tigris_use_cache = TRUE)
+options(scipen = 999)
+```
+
+---
+
+## 1. Load and Prepare Data
+
+```{r load}
+panel <- read_csv("../data/processed/final_data_monthly.csv",
+                  col_types = cols(GEOID = col_character()))
+
+demo <- read_csv("../data/processed/cbg_demographics.csv",
+                 col_types = cols(GEOID = col_character()))
+
+# Cross-section with demographics
+cross <- panel %>%
+  group_by(GEOID) %>%
+  summarise(
+    mean_delta_pm25   = mean(mean_delta_pm25,   na.rm = TRUE),
+    pct_trips_worse   = mean(pct_trips_worse,   na.rm = TRUE),
+    mobility_adj_pm25 = mean(mobility_adj_pm25, na.rm = TRUE),
+    residential_pm25  = mean(residential_pm25,  na.rm = TRUE),
+    n_destinations    = mean(n_destinations,    na.rm = TRUE),
+    pct_low_count     = mean(pct_low_count,     na.rm = TRUE),
+    n_months          = n(),
+    .groups = "drop"
+  ) %>%
+  left_join(demo, by = "GEOID") %>%
+  mutate(
+    log_median_income = log(median_income),
+    state = case_when(
+      substr(GEOID, 1, 2) == "11" ~ "DC",
+      substr(GEOID, 1, 2) == "24" ~ "MD",
+      substr(GEOID, 1, 2) == "51" ~ "VA"
+    )
+  )
+
+# Load shapefile
+dmv_counties <- c("11001","24031","24033","51013","51059","51510","51600","51610")
+
+cbg_shp <- map_dfr(c("DC","MD","VA"),
+                   ~block_groups(state = .x, year = 2019, cb = TRUE)) %>%
+  filter(substr(GEOID, 1, 5) %in% dmv_counties) %>%
+  st_transform(4326)
+
+# Complete cases for modeling
+model_vars <- c("GEOID","mean_delta_pm25","pct_nonwhite",
+                "log_median_income","pct_no_vehicle",
+                "pct_college","residential_pm25","pct_low_count")
+
+model_data <- cross[, model_vars] %>% drop_na()
+
+cbg_sf <- cbg_shp %>% inner_join(model_data, by = "GEOID")
+
+cat("Model sample size:", nrow(cbg_sf), "\n")
+
+# Spatial weights
+nb  <- poly2nb(cbg_sf, queen = TRUE)
+lw  <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# KNN-5 for robustness
+coords  <- st_coordinates(st_centroid(cbg_sf))
+nb_knn5 <- knn2nb(knearneigh(coords, k = 5))
+lw_knn5 <- nb2listw(nb_knn5, style = "W", zero.policy = TRUE)
+
+# Standardized predictors for effect size comparison
+cbg_sf <- cbg_sf %>%
+  mutate(
+    pct_nonwhite_z     = scale(pct_nonwhite)[,1],
+    log_income_z       = scale(log_median_income)[,1],
+    pct_no_vehicle_z   = scale(pct_no_vehicle)[,1],
+    pct_college_z      = scale(pct_college)[,1],
+    residential_pm25_z = scale(residential_pm25)[,1]
+  )
+```
+
+---
+
+## 2. Model Formulas
+
+```{r formulas}
+# Unstandardized — for interpretation in original units
+base_formula <- mean_delta_pm25 ~ pct_nonwhite + log_median_income +
+  pct_no_vehicle + pct_college + residential_pm25
+
+# Interaction — primary model (M4)
+interact_formula <- mean_delta_pm25 ~ pct_nonwhite * residential_pm25 +
+  log_median_income + pct_no_vehicle + pct_college
+
+# Standardized — for effect size comparison
+std_formula <- mean_delta_pm25 ~ pct_nonwhite_z + log_income_z +
+  pct_no_vehicle_z + pct_college_z + residential_pm25_z
+```
+
+---
+
+## 3. RQ1/RQ2 — Spatial Model Selection
+
+```{r m1-ols}
+# M1: OLS baseline
+m1 <- lm(base_formula, data = cbg_sf)
+cat("--- M1 OLS ---\n")
+print(summary(m1))
+
+cat("\nMoran's I on OLS residuals:\n")
+moran_ols <- moran.test(residuals(m1), lw, zero.policy = TRUE)
+print(moran_ols)
+
+cat("\nLagrange Multiplier tests:\n")
+print(lm.RStests(m1, lw, test = "all", zero.policy = TRUE))
+```
+
+```{r m2-sem}
+# M2: Spatial Error Model — base specification
+m2 <- errorsarlm(base_formula, data = cbg_sf,
+                 listw = lw, zero.policy = TRUE)
+cat("--- M2 SEM ---\n")
+print(summary(m2))
+
+cat("\nMoran's I on SEM residuals:\n")
+print(moran.test(residuals(m2), lw, zero.policy = TRUE))
+```
+
+```{r m3-slm}
+# M3: Spatial Lag Model — robustness check
+m3 <- lagsarlm(base_formula, data = cbg_sf,
+               listw = lw, zero.policy = TRUE)
+cat("--- M3 SLM ---\n")
+print(summary(m3))
+
+cat("\nSpatial impacts (direct / indirect / total):\n")
+m3_impacts <- impacts(m3, listw = lw, R = 500)
+print(summary(m3_impacts, zstats = TRUE, short = TRUE))
+```
+
+---
+
+## 4. RQ3 — Interaction Model (Primary)
+
+```{r m4-interact}
+# M4: SEM with interaction — primary model
+m4 <- errorsarlm(interact_formula, data = cbg_sf,
+                 listw = lw, zero.policy = TRUE)
+cat("--- M4 SEM Interaction (Primary) ---\n")
+print(summary(m4))
+
+cat("\nLR test M4 vs M2:\n")
+print(lrtest(m4, m2))
+```
+
+```{r interaction-interpretation}
+# Marginal effect of pct_nonwhite at different levels of residential_pm25
+b_nw  <- coef(m4)["pct_nonwhite"]
+b_int <- coef(m4)["pct_nonwhite:residential_pm25"]
+q25   <- quantile(cbg_sf$residential_pm25, 0.25, na.rm = TRUE)
+med   <- median(cbg_sf$residential_pm25, na.rm = TRUE)
+q75   <- quantile(cbg_sf$residential_pm25, 0.75, na.rm = TRUE)
+
+tibble(
+  residential_pm25_level = c(
+    paste0("Q25 (", round(q25, 2), " ug/m3) — suburban"),
+    paste0("Median (", round(med, 2), " ug/m3)"),
+    paste0("Q75 (", round(q75, 2), " ug/m3) — urban")
+  ),
+  marginal_effect_pct_nonwhite = round(c(
+    b_nw + b_int * q25,
+    b_nw + b_int * med,
+    b_nw + b_int * q75
+  ), 6)
+) %>%
+  knitr::kable(caption = "Table 10. Marginal Effect of pct_nonwhite at Different Residential PM2.5 Levels")
+```
+
+```{r marginal-effects-plot, fig.cap="Figure 11. Marginal effect of pct_nonwhite on mean_delta_pm25 across residential PM2.5 range. Effect shrinks in already-polluted areas — the spatial trap mechanism."}
+res_range <- seq(min(cbg_sf$residential_pm25, na.rm = TRUE),
+                 max(cbg_sf$residential_pm25, na.rm = TRUE),
+                 length.out = 100)
+
+# Standard error for interaction via delta method (approximate)
+vcov_m4  <- vcov(m4)
+se_int   <- sqrt(vcov_m4["pct_nonwhite", "pct_nonwhite"] +
+                 res_range^2 * vcov_m4["pct_nonwhite:residential_pm25",
+                                        "pct_nonwhite:residential_pm25"] +
+                 2 * res_range * vcov_m4["pct_nonwhite",
+                                          "pct_nonwhite:residential_pm25"])
+
+marginal_df <- tibble(
+  residential_pm25 = res_range,
+  effect           = b_nw + b_int * res_range,
+  lower            = effect - 1.96 * se_int,
+  upper            = effect + 1.96 * se_int
+)
+
+ggplot(marginal_df, aes(x = residential_pm25, y = effect)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, fill = "#d73027") +
+  geom_line(color = "#d73027", linewidth = 1) +
+  geom_vline(xintercept = c(q25, med, q75),
+             linetype = "dotted", color = "gray60") +
+  annotate("text", x = q25, y = max(marginal_df$upper),
+           label = "Q25\nSuburban", size = 3, hjust = 0.5) +
+  annotate("text", x = q75, y = max(marginal_df$upper),
+           label = "Q75\nUrban", size = 3, hjust = 0.5) +
+  labs(
+    x     = "Residential PM2.5 (ug/m3)",
+    y     = "Marginal Effect of pct_nonwhite",
+    title = "Spatial Trap: Race Effect on Mobility Exposure by Residential Baseline",
+    subtitle = "Effect of racial composition shrinks as residential PM2.5 increases"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+---
+
+## 5. RQ4 — COVID Period Comparison
+
+```{r covid-split}
+# Build pre-COVID and COVID era cross-sections
+make_period_cross <- function(panel_data, years) {
+  panel_data %>%
+    filter(year %in% years) %>%
+    group_by(GEOID) %>%
+    summarise(
+      mean_delta_pm25  = mean(mean_delta_pm25,  na.rm = TRUE),
+      residential_pm25 = mean(residential_pm25, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    left_join(demo %>% mutate(log_median_income = log(median_income)),
+              by = "GEOID") %>%
+    drop_na(mean_delta_pm25, pct_nonwhite, log_median_income,
+            pct_no_vehicle, pct_college, residential_pm25)
+}
+
+pre_cross   <- make_period_cross(panel, c(2018, 2019))
+covid_cross <- make_period_cross(panel, c(2020, 2021))
+
+# Standardized predictors for each period
+standardize <- function(x) (x - mean(x, na.rm=TRUE)) / sd(x, na.rm=TRUE)
+
+add_std <- function(df) {
+  df %>% mutate(
+    pct_nonwhite_z     = standardize(pct_nonwhite),
+    log_income_z       = standardize(log_median_income),
+    pct_no_vehicle_z   = standardize(pct_no_vehicle),
+    pct_college_z      = standardize(pct_college),
+    residential_pm25_z = standardize(residential_pm25)
+  )
+}
+
+pre_cross   <- add_std(pre_cross)
+covid_cross <- add_std(covid_cross)
+
+std_base <- mean_delta_pm25 ~ pct_nonwhite_z + log_income_z +
+  pct_no_vehicle_z + pct_college_z + residential_pm25_z
+
+# Build spatial weights for each period
+fit_period_sem <- function(cross_data, label) {
+  sf_data <- cbg_shp %>%
+    inner_join(cross_data, by = "GEOID") %>%
+    filter(!is.na(mean_delta_pm25))
+
+  nb_p <- poly2nb(sf_data, queen = TRUE)
+  lw_p <- nb2listw(nb_p, style = "W", zero.policy = TRUE)
+
+  model <- errorsarlm(std_base, data = sf_data,
+                      listw = lw_p, zero.policy = TRUE)
+
+  coef_df <- as.data.frame(summary(model)$Coef) %>%
+    rownames_to_column("variable") %>%
+    mutate(period = label,
+           sig = case_when(
+             `Pr(>|z|)` < 0.001 ~ "***",
+             `Pr(>|z|)` < 0.01  ~ "**",
+             `Pr(>|z|)` < 0.05  ~ "*",
+             TRUE ~ ""
+           ))
+  coef_df
+}
+
+cat("Fitting Pre-COVID SEM...\n")
+pre_coefs <- fit_period_sem(pre_cross, "Pre-COVID (2018-2019)")
+
+cat("Fitting COVID Era SEM...\n")
+covid_coefs <- fit_period_sem(covid_cross, "COVID Era (2020-2021)")
+
+# Combined coefficient table
+bind_rows(pre_coefs, covid_coefs) %>%
+  filter(variable != "(Intercept)") %>%
+  select(period, variable, Estimate, `Std. Error`, `Pr(>|z|)`, sig) %>%
+  mutate(across(where(is.numeric), ~round(.x, 5))) %>%
+  arrange(variable, period) %>%
+  knitr::kable(caption = "Table 11. Standardized SEM Coefficients: Pre-COVID vs COVID Era")
+```
+
+```{r covid-coef-plot, fig.cap="Figure 12. Standardized coefficients pre-COVID vs COVID era. Demographic gradients compressed during COVID."}
+bind_rows(pre_coefs, covid_coefs) %>%
+  filter(!variable %in% c("(Intercept)")) %>%
+  mutate(
+    lower = Estimate - 1.96 * `Std. Error`,
+    upper = Estimate + 1.96 * `Std. Error`
+  ) %>%
+  ggplot(aes(x = Estimate, y = variable, color = period, shape = period)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_pointrange(aes(xmin = lower, xmax = upper),
+                  position = position_dodge(width = 0.4),
+                  linewidth = 0.7, size = 0.6) +
+  scale_color_manual(values = c("#2166ac", "#d73027"),
+                     name = "Period") +
+  scale_shape_manual(values = c(16, 17), name = "Period") +
+  labs(
+    x     = "Standardized Coefficient (±95% CI)",
+    y     = NULL,
+    title = "Coefficient Comparison: Pre-COVID vs COVID Era",
+    subtitle = "Standardized predictors — coefficients are directly comparable"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+---
+
+## 6. Robustness Check — KNN-5 Weights
+
+```{r m7-knn5}
+m7 <- errorsarlm(base_formula, data = cbg_sf,
+                 listw = lw_knn5, zero.policy = TRUE)
+
+# Coefficient comparison
+coef_m2 <- coef(m2)
+coef_m7 <- coef(m7)
+common  <- intersect(names(coef_m2), names(coef_m7))
+
+tibble(
+  variable = common,
+  M2_queen = round(coef_m2[common], 5),
+  M7_knn5  = round(coef_m7[common], 5),
+  diff     = round(coef_m7[common] - coef_m2[common], 5)
+) %>%
+  knitr::kable(caption = "Table 12. Robustness Check: Queen Contiguity vs KNN-5 Weights")
+```
+
+---
+
+## 7. Model Comparison Summary
+
+```{r model-comparison}
+# Extract coefficients helper
+extract_coefs <- function(model, name) {
+  if (inherits(model, "lm")) {
+    cf <- summary(model)$coefficients
+  } else {
+    cf <- summary(model)$Coef
+  }
+  as.data.frame(cf) %>%
+    rownames_to_column("variable") %>%
+    mutate(model = name)
+}
+
+key_vars <- c("pct_nonwhite","log_median_income","pct_no_vehicle",
+              "pct_college","residential_pm25","pct_nonwhite:residential_pm25")
+
+bind_rows(
+  extract_coefs(m1, "M1 OLS"),
+  extract_coefs(m2, "M2 SEM"),
+  extract_coefs(m3, "M3 SLM"),
+  extract_coefs(m4, "M4 SEM+Interaction")
+) %>%
+  filter(variable %in% key_vars) %>%
+  mutate(
+    sig = case_when(
+      `Pr(>|z|)` < 0.001 | `Pr(>|t|)` < 0.001 ~ "***",
+      `Pr(>|z|)` < 0.01  | `Pr(>|t|)` < 0.01  ~ "**",
+      `Pr(>|z|)` < 0.05  | `Pr(>|t|)` < 0.05  ~ "*",
+      TRUE ~ ""
+    ),
+    estimate_se = paste0(round(Estimate, 5), " (", round(`Std. Error`, 5), ")", sig)
+  ) %>%
+  select(model, variable, estimate_se) %>%
+  pivot_wider(names_from = model, values_from = estimate_se) %>%
+  knitr::kable(caption = "Table 13. Model Comparison — Key Coefficients (SE in parentheses)")
+```
+
+```{r fit-summary}
+tibble(
+  Model          = c("M1 OLS", "M2 SEM", "M3 SLM", "M4 SEM+Interaction"),
+  AIC            = round(c(AIC(m1), AIC(m2), AIC(m3), AIC(m4)), 1),
+  LogLik         = round(c(as.numeric(logLik(m1)), as.numeric(logLik(m2)),
+                            as.numeric(logLik(m3)), as.numeric(logLik(m4))), 1),
+  Spatial_param  = c("—",
+                     paste0("λ = ", round(m2$lambda, 3)),
+                     paste0("ρ = ", round(m3$rho,    3)),
+                     paste0("λ = ", round(m4$lambda, 3))),
+  Primary        = c("", "", "", "✓")
+) %>%
+  knitr::kable(caption = "Table 14. Model Fit Summary")
+```
+
+```{r coef-plot, fig.cap="Figure 13. Coefficient plot for M2 SEM (base) and M4 SEM (interaction). Residential PM2.5 dominates; demographic effects significant after spatial correction."}
+m2_coefs <- as.data.frame(summary(m2)$Coef) %>%
+  rownames_to_column("variable") %>%
+  filter(variable != "(Intercept)") %>%
+  mutate(
+    lower = Estimate - 1.96 * `Std. Error`,
+    upper = Estimate + 1.96 * `Std. Error`,
+    model = "M2 SEM (base)"
+  )
+
+m4_coefs <- as.data.frame(summary(m4)$Coef) %>%
+  rownames_to_column("variable") %>%
+  filter(variable != "(Intercept)") %>%
+  mutate(
+    lower = Estimate - 1.96 * `Std. Error`,
+    upper = Estimate + 1.96 * `Std. Error`,
+    model = "M4 SEM (interaction)"
+  )
+
+bind_rows(m2_coefs, m4_coefs) %>%
+  filter(variable != "residential_pm25") %>%   # exclude dominant term for scale
+  ggplot(aes(x = Estimate, y = variable, color = model, shape = model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_pointrange(aes(xmin = lower, xmax = upper),
+                  position = position_dodge(width = 0.4),
+                  linewidth = 0.7, size = 0.6) +
+  scale_color_manual(values = c("#2166ac","#d73027"), name = "Model") +
+  scale_shape_manual(values = c(16, 17), name = "Model") +
+  labs(
+    x     = "Coefficient (±95% CI)",
+    y     = NULL,
+    title = "Spatial Regression Coefficients — M2 vs M4",
+    subtitle = "residential_pm25 excluded for scale (M2: -0.889, M4: -0.864)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+---
+
+*End of modeling analysis.*

@@ -1,0 +1,291 @@
+---
+title: "Spatial Analysis — Mobility-Driven PM2.5 Exposure Disparity in the DMV"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 6
+)
+```
+
+```{r libraries}
+library(tidyverse)
+library(sf)
+library(spdep)
+library(tigris)
+library(scales)
+```
+
+options(tigris_use_cache = TRUE)
+
+---
+
+## 1. Load Data and Shapefile
+
+```{r load}
+panel <- read_csv("../data/processed/final_data_monthly.csv",
+                  col_types = cols(GEOID = col_character()))
+
+demo <- read_csv("../data/processed/cbg_demographics.csv",
+                 col_types = cols(GEOID = col_character()))
+
+cross <- panel %>%
+  group_by(GEOID) %>%
+  summarise(
+    mean_delta_pm25   = mean(mean_delta_pm25,   na.rm = TRUE),
+    pct_trips_worse   = mean(pct_trips_worse,   na.rm = TRUE),
+    mobility_adj_pm25 = mean(mobility_adj_pm25, na.rm = TRUE),
+    residential_pm25  = mean(residential_pm25,  na.rm = TRUE),
+    n_destinations    = mean(n_destinations,    na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(demo, by = "GEOID") %>%
+  mutate(
+    log_median_income = log(median_income),
+    state = case_when(
+      substr(GEOID, 1, 2) == "11" ~ "DC",
+      substr(GEOID, 1, 2) == "24" ~ "MD",
+      substr(GEOID, 1, 2) == "51" ~ "VA"
+    )
+  )
+
+# Load CBG shapefile
+dmv_counties <- c("11001","24031","24033","51013","51059","51510","51600","51610")
+
+cbg_shp <- map_dfr(c("DC","MD","VA"), ~block_groups(state = .x, year = 2019, cb = TRUE)) %>%
+  filter(substr(GEOID, 1, 5) %in% dmv_counties) %>%
+  st_transform(4326)
+
+# Join cross-section to shapefile
+cbg_sf <- cbg_shp %>%
+  left_join(cross, by = "GEOID") %>%
+  filter(!is.na(mean_delta_pm25))
+
+cat("CBGs with geometry and outcome:", nrow(cbg_sf), "\n")
+```
+
+---
+
+## 2. Choropleth Maps
+
+```{r choropleth-delta, fig.cap="Figure 6. Spatial distribution of mean delta PM2.5 across DMV CBGs."}
+ggplot(cbg_sf) +
+  geom_sf(aes(fill = mean_delta_pm25), color = NA) +
+  scale_fill_gradient2(
+    low      = "#4575b4",
+    mid      = "white",
+    high     = "#d73027",
+    midpoint = 0,
+    name     = "Delta\nPM2.5\n(ug/m3)",
+    labels   = number_format(accuracy = 0.1)
+  ) +
+  labs(
+    title    = "Mobility-Driven PM2.5 Exposure Differential",
+    subtitle = "Mean (destination PM2.5 - origin PM2.5) per CBG, 2018-2021",
+    caption  = "Red = travels into worse air | Blue = travels into cleaner air"
+  ) +
+  theme_void(base_size = 11) +
+  theme(legend.position = "right")
+```
+
+```{r choropleth-residential, fig.cap="Figure 7. Residential PM2.5 baseline per CBG."}
+ggplot(cbg_sf) +
+  geom_sf(aes(fill = residential_pm25), color = NA) +
+  scale_fill_viridis_c(
+    name   = "Residential\nPM2.5\n(ug/m3)",
+    option = "magma",
+    direction = -1
+  ) +
+  labs(
+    title    = "Residential PM2.5 Baseline",
+    subtitle = "Mean annual PM2.5 at origin CBG, 2018-2021"
+  ) +
+  theme_void(base_size = 11) +
+  theme(legend.position = "right")
+```
+
+---
+
+## 3. Spatial Weights
+
+```{r weights}
+nb <- poly2nb(cbg_sf, queen = TRUE)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+cat("Queen contiguity neighbour summary:\n")
+print(summary(nb))
+```
+
+---
+
+## 4. Global Spatial Autocorrelation — Moran's I
+
+```{r morans}
+moran_vars <- c("mean_delta_pm25", "pct_trips_worse", "residential_pm25",
+                "mobility_adj_pm25", "pct_nonwhite", "pct_poverty",
+                "median_income", "pct_no_vehicle")
+
+moran_results <- map_dfr(moran_vars, function(v) {
+  x <- cbg_sf[[v]]
+  x <- if_else(is.na(x), mean(x, na.rm = TRUE), x)
+  mt <- moran.test(x, lw, zero.policy = TRUE)
+  tibble(
+    variable      = v,
+    moran_i       = round(mt$estimate[1], 4),
+    p_value       = round(mt$p.value, 6),
+    interpretation = if_else(mt$p.value < 0.05,
+                             if_else(mt$estimate[1] > 0,
+                                     "Clustered (+)", "Dispersed (-)"),
+                             "Random")
+  )
+})
+
+moran_results %>%
+  knitr::kable(caption = "Table 8. Global Moran's I for Key Variables")
+```
+
+```{r correlogram, fig.cap="Figure 8. Spatial correlogram showing decay of autocorrelation in mean delta PM2.5 across 5 lags."}
+x_delta <- cbg_sf$mean_delta_pm25
+x_delta <- if_else(is.na(x_delta), mean(x_delta, na.rm = TRUE), x_delta)
+
+sp_corr <- sp.correlogram(nb, x_delta, order = 5,
+                           method = "I", zero.policy = TRUE)
+
+sp_corr_df <- tibble(
+  lag   = 1:5,
+  I     = sp_corr$res[, 1],
+  lower = sp_corr$res[, 1] - 1.96 * sqrt(sp_corr$res[, 3]),
+  upper = sp_corr$res[, 1] + 1.96 * sqrt(sp_corr$res[, 3])
+)
+
+ggplot(sp_corr_df, aes(x = lag, y = I)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, fill = "#2166ac") +
+  geom_line(color = "#2166ac", linewidth = 0.8) +
+  geom_point(color = "#2166ac", size = 3) +
+  scale_x_continuous(breaks = 1:5) +
+  labs(
+    x     = "Spatial Lag",
+    y     = "Moran's I",
+    title = "Spatial Correlogram — Mean Delta PM2.5",
+    subtitle = "Autocorrelation decays but remains significant through 5 lags"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+---
+
+## 5. Local Spatial Autocorrelation — LISA
+
+```{r lisa}
+lisa      <- localmoran(x_delta, lw, zero.policy = TRUE)
+xz        <- scale(x_delta)[, 1]
+lagz      <- lag.listw(lw, xz, zero.policy = TRUE)
+lisa_p    <- lisa[, "Pr(z != E(Ii))"]
+
+cbg_sf <- cbg_sf %>%
+  mutate(
+    lisa_quad = case_when(
+      xz > 0 & lagz > 0 & lisa_p < 0.05 ~ "HH — High cluster",
+      xz < 0 & lagz < 0 & lisa_p < 0.05 ~ "LL — Low cluster",
+      xz > 0 & lagz < 0 & lisa_p < 0.05 ~ "HL — Outlier",
+      xz < 0 & lagz > 0 & lisa_p < 0.05 ~ "LH — Outlier",
+      TRUE ~ "Not significant"
+    )
+  )
+
+cat("LISA cluster counts:\n")
+print(table(cbg_sf$lisa_quad))
+```
+
+```{r lisa-map, fig.cap="Figure 9. LISA cluster map of mean delta PM2.5. HH clusters (red) in suburban ring; LL clusters (blue) in DC urban core."}
+lisa_colors <- c(
+  "HH — High cluster"  = "#d73027",
+  "LL — Low cluster"   = "#4575b4",
+  "HL — Outlier"       = "#fdae61",
+  "LH — Outlier"       = "#abd9e9",
+  "Not significant"    = "gray90"
+)
+
+ggplot(cbg_sf) +
+  geom_sf(aes(fill = lisa_quad), color = NA) +
+  scale_fill_manual(values = lisa_colors, name = "LISA Cluster") +
+  labs(
+    title    = "LISA Cluster Map — Mean Delta PM2.5",
+    subtitle = "Local Moran's I, p < 0.05"
+  ) +
+  theme_void(base_size = 11) +
+  theme(legend.position = "right")
+```
+
+---
+
+## 6. Demographic Maps
+
+```{r demo-maps, fig.cap="Figure 10. Spatial distribution of key demographic predictors."}
+map_demo <- function(sf, var, title, palette = "Blues") {
+  ggplot(sf) +
+    geom_sf(aes(fill = .data[[var]]), color = NA) +
+    scale_fill_distiller(palette = palette, direction = 1,
+                         name = NULL,
+                         labels = number_format(accuracy = 1)) +
+    labs(title = title) +
+    theme_void(base_size = 9) +
+    theme(legend.position = "bottom",
+          legend.key.width = unit(1.5, "cm"))
+}
+
+p1 <- map_demo(cbg_sf, "pct_nonwhite",   "% Nonwhite",        "RdPu")
+p2 <- map_demo(cbg_sf, "pct_no_vehicle", "% No Vehicle",      "Oranges")
+p3 <- map_demo(cbg_sf, "pct_poverty",    "% Poverty",         "YlOrRd")
+p4 <- map_demo(cbg_sf, "median_income",  "Median Income ($)", "Greens")
+
+library(patchwork)
+(p1 + p2) / (p3 + p4) +
+  plot_annotation(title = "Demographic Predictors — Spatial Distribution")
+```
+
+---
+
+## 7. Temporal Moran's I
+
+```{r temporal-morans}
+temporal_moran <- map_dfr(2018:2021, function(yr) {
+  yr_cross <- panel %>%
+    filter(year == yr) %>%
+    group_by(GEOID) %>%
+    summarise(mean_delta = mean(mean_delta_pm25, na.rm = TRUE), .groups = "drop")
+
+  yr_sf <- cbg_shp %>%
+    left_join(yr_cross, by = "GEOID") %>%
+    filter(!is.na(mean_delta))
+
+  nb_yr <- poly2nb(yr_sf, queen = TRUE)
+  lw_yr <- nb2listw(nb_yr, style = "W", zero.policy = TRUE)
+  mt    <- moran.test(yr_sf$mean_delta, lw_yr, zero.policy = TRUE)
+
+  tibble(
+    year    = yr,
+    moran_i = round(mt$estimate[1], 4),
+    p_value = round(mt$p.value, 6),
+    n_cbgs  = nrow(yr_sf)
+  )
+})
+
+temporal_moran %>%
+  knitr::kable(caption = "Table 9. Moran's I on Mean Delta PM2.5 by Year")
+```
+
+---
+
+*End of spatial analysis. Proceed to 07_modeling.Rmd for regression models.*
